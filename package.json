@@ -1,0 +1,18 @@
+{
+  "name": "ju-ethiopia-grade-bot",
+  "version": "1.0.0",
+  "description": "Jimma University Grade Viewer Telegram Bot",
+  "main": "api/bot.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12"
+  },
+  "devDependencies": {
+    "vercel": "^28.0.0"
+  }
+}
