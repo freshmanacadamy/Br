@@ -9,12 +9,10 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { webHook: true });
 const JU_BASE_URL = 'https://portal.ju.edu.et';
 const PORTAL_URLS = {
   login: `${JU_BASE_URL}/login`,
-  announcement: `${JU_BASE_URL}/announce/show`,
-  grades: `${JU_BASE_URL}/student/academic/grade`,
-  dashboard: `${JU_BASE_URL}/student/dashboard`
+  grades: `${JU_BASE_URL}/student/academic/grade`
 };
 
-// Store user sessions temporarily
+// Store user sessions
 const userSessions = new Map();
 
 // Set webhook
@@ -26,105 +24,158 @@ const setWebhook = async () => {
   }
 };
 
-// Function to login and fetch grades from JU portal
+// Function to login and fetch grades
 async function fetchJUGrades(username, password) {
-  let session = null;
+  console.log('=== STARTING LOGIN PROCESS ===');
   
   try {
-    // Create axios session to maintain cookies
-    session = axios.create({
-      timeout: 30000,
+    // Create axios instance with better configuration
+    const session = axios.create({
+      timeout: 15000,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Connection': 'keep-alive'
-      },
-      maxRedirects: 5
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
     });
 
-    console.log('Step 1: Getting login page for:', username);
-
-    // Step 1: Get login page to obtain cookies and CSRF token
+    console.log('1. Fetching login page...');
+    
+    // Get login page
     const loginPageResponse = await session.get(PORTAL_URLS.login);
-    console.log('Login page status:', loginPageResponse.status);
+    console.log('   Login page status:', loginPageResponse.status);
     
     const $login = cheerio.load(loginPageResponse.data);
     
-    // Extract CSRF token
-    let csrfToken = $login('input[name="_token"]').val();
-    console.log('CSRF Token found:', !!csrfToken);
+    // Debug: Check page content
+    const pageTitle = $login('title').text();
+    console.log('   Page title:', pageTitle);
+    
+    // Find all form inputs for debugging
+    const formInputs = [];
+    $login('input').each((i, elem) => {
+      formInputs.push({
+        name: $(elem).attr('name'),
+        type: $(elem).attr('type'),
+        value: $(elem).attr('value')
+      });
+    });
+    console.log('   Form inputs found:', formInputs);
+
+    // Get CSRF token from common locations
+    const csrfToken = $login('input[name="_token"]').val() || 
+                     $login('input[name="csrf_token"]').val() ||
+                     $login('meta[name="csrf-token"]').attr('content');
+    console.log('   CSRF token:', csrfToken ? 'Found' : 'Not found');
+
+    // Find username and password fields
+    const usernameField = $login('input[type="text"], input[name="username"], input[name="email"], input[name="login"]').attr('name') || 'username';
+    const passwordField = $login('input[type="password"]').attr('name') || 'password';
+    
+    console.log('   Username field:', usernameField);
+    console.log('   Password field:', passwordField);
 
     // Prepare login data
     const loginData = new URLSearchParams();
-    loginData.append('username', username);
-    loginData.append('password', password);
+    loginData.append(usernameField, username);
+    loginData.append(passwordField, password);
     
     if (csrfToken) {
       loginData.append('_token', csrfToken);
     }
 
-    console.log('Step 2: Attempting login...');
-
-    // Step 2: Perform login
+    console.log('2. Attempting login...');
+    
+    // Perform login
     const loginResponse = await session.post(PORTAL_URLS.login, loginData, {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Referer': PORTAL_URLS.login,
         'Origin': JU_BASE_URL
-      }
+      },
+      maxRedirects: 5
     });
 
-    console.log('Login response status:', loginResponse.status);
+    console.log('   Login response status:', loginResponse.status);
+    console.log('   Login response URL:', loginResponse.config.url);
 
-    // Check if login was successful by trying to access grades page
-    try {
-      console.log('Step 3: Accessing grades page...');
-      const gradesResponse = await session.get(PORTAL_URLS.grades);
-      
-      if (gradesResponse.status === 200) {
-        const $grades = cheerio.load(gradesResponse.data);
-        const gradeData = parseGradeData($grades, username);
-        return gradeData;
-      } else {
+    // Check if login was successful
+    const $postLogin = cheerio.load(loginResponse.data);
+    const postLoginTitle = $postLogin('title').text();
+    console.log('   After login title:', postLoginTitle);
+
+    // Check for common success indicators
+    const hasLogout = $postLogin('a[href*="logout"], button[href*="logout"]').length > 0;
+    const hasDashboard = $postLogin('a[href*="dashboard"], .dashboard').length > 0;
+    const hasStudentMenu = $postLogin('a[href*="student"]').length > 0;
+    
+    console.log('   Has logout link:', hasLogout);
+    console.log('   Has dashboard:', hasDashboard);
+    console.log('   Has student menu:', hasStudentMenu);
+
+    if (!hasLogout && !hasDashboard) {
+      // Check for login errors
+      const errorText = $postLogin('.alert-danger, .error, .text-danger').text().trim();
+      if (errorText) {
+        console.log('   Login error:', errorText);
         return {
           success: false,
-          error: 'Access denied to grade page. Please check your credentials.'
+          error: `Login failed: ${errorText.substring(0, 100)}`
         };
       }
-    } catch (gradeError) {
-      console.log('Grade page access failed, trying dashboard...');
       
-      // Try dashboard as fallback
-      const dashboardResponse = await session.get(PORTAL_URLS.dashboard);
-      const $dashboard = cheerio.load(dashboardResponse.data);
-      const dashboardData = parseDashboardData($dashboard, username);
-      return dashboardData;
+      // If we can't determine success, try to access grades page anyway
+      console.log('   Could not determine login status, trying grades page...');
     }
 
-  } catch (error) {
-    console.error('Fetch grade error:', error.message);
+    console.log('3. Accessing grades page...');
     
-    if (error.response?.status === 401 || error.response?.status === 403) {
-      return {
-        success: false,
-        error: 'Invalid username or password.'
-      };
-    } else if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
-      return {
-        success: false,
-        error: 'University portal is currently unavailable. Please try again later.'
-      };
-    } else {
-      return {
-        success: false,
-        error: `Login failed: ${error.message}`
-      };
+    // Try to access grades page
+    const gradesResponse = await session.get(PORTAL_URLS.grades);
+    console.log('   Grades page status:', gradesResponse.status);
+    
+    const $grades = cheerio.load(gradesResponse.data);
+    const gradesTitle = $grades('title').text();
+    console.log('   Grades page title:', gradesTitle);
+
+    // Parse grade data
+    const gradeData = parseGradeData($grades, username);
+    console.log('   Grade parsing result:', gradeData.success ? 'Success' : 'Failed');
+    
+    return gradeData;
+
+  } catch (error) {
+    console.log('=== ERROR DETAILS ===');
+    console.log('Error message:', error.message);
+    console.log('Error code:', error.code);
+    
+    if (error.response) {
+      console.log('Response status:', error.response.status);
+      console.log('Response URL:', error.response.config?.url);
     }
+
+    let errorMessage = 'Login failed. ';
+    
+    if (error.code === 'ECONNREFUSED') {
+      errorMessage += 'Cannot connect to university portal.';
+    } else if (error.code === 'ETIMEDOUT') {
+      errorMessage += 'Connection timeout. Please try again.';
+    } else if (error.response?.status === 401) {
+      errorMessage += 'Invalid username or password.';
+    } else if (error.response?.status === 403) {
+      errorMessage += 'Access denied.';
+    } else {
+      errorMessage += error.message;
+    }
+
+    return {
+      success: false,
+      error: errorMessage
+    };
   }
 }
 
-// Function to parse grade data from grade page
+// Function to parse grade data (simplified)
 function parseGradeData($, username) {
   try {
     const grades = [];
@@ -133,38 +184,33 @@ function parseGradeData($, username) {
       id: username,
       program: 'N/A'
     };
-    
-    // Try to extract student information
-    studentInfo.name = $('.student-name, .profile-name, .user-name').first().text().trim() || 
-                      $('h1, h2, h3').first().text().trim() ||
-                      studentInfo.name;
 
-    // Extract grades from tables - look for grade tables specifically
-    $('table').each((tableIndex, table) => {
+    // Try to find student name
+    studentInfo.name = $('.student-name, .profile-name, .user-name, .name').first().text().trim() || 
+                      $('h1, h2').first().text().trim() ||
+                      'Student';
+
+    // Look for grade tables
+    $('table').each((i, table) => {
       const $table = $(table);
-      const tableText = $table.text().toLowerCase();
+      const rows = $table.find('tr');
       
-      // Check if this table likely contains grade information
-      if (tableText.includes('grade') || tableText.includes('credit') || 
-          tableText.includes('course') || tableText.includes('code') ||
-          tableText.includes('subject') || tableText.includes('result')) {
-        
-        $table.find('tr').each((rowIndex, row) => {
-          if (rowIndex > 0) { // Skip header row
-            const $row = $(row);
-            const cols = $row.find('td');
-            
-            if (cols.length >= 4) {
-              const course = {
-                code: $(cols[0]).text().trim() || `C${rowIndex}`,
-                name: $(cols[1]).text().trim() || 'Course',
-                credit: $(cols[2]).text().trim() || '0',
-                grade: $(cols[3]).text().trim() || 'N/A'
-              };
+      if (rows.length > 1) {
+        rows.each((j, row) => {
+          if (j > 0) { // Skip header
+            const cols = $(row).find('td');
+            if (cols.length >= 2) {
+              const courseCode = $(cols[0]).text().trim();
+              const courseName = $(cols[1]).text().trim();
+              const grade = $(cols[cols.length - 1]).text().trim();
               
-              // Only add if it looks like a real course
-              if (course.code && course.grade && course.grade !== 'N/A') {
-                grades.push(course);
+              if (courseCode && grade) {
+                grades.push({
+                  code: courseCode,
+                  name: courseName || 'Course',
+                  credit: 'N/A',
+                  grade: grade
+                });
               }
             }
           }
@@ -172,204 +218,116 @@ function parseGradeData($, username) {
       }
     });
 
-    // If no grades found in structured tables, try to find any grade-like data
+    // If no structured grades found, look for any grade-like text
     if (grades.length === 0) {
-      $('td, .grade, .result').each((i, element) => {
-        const text = $(element).text().trim();
-        const gradeMatch = text.match(/^[A-F][+-]?$|^[0-4]\.?[0-9]*$/);
-        if (gradeMatch) {
+      $('body').text().split('\n').forEach(line => {
+        const trimmed = line.trim();
+        const gradeMatch = trimmed.match(/([A-F][+-]?|[0-4]\.?[0-9]*)$/);
+        if (gradeMatch && trimmed.length < 100) {
           grades.push({
-            code: `C${i+1}`,
+            code: `C${grades.length + 1}`,
             name: 'Course',
-            credit: '0',
-            grade: text
+            credit: 'N/A',
+            grade: gradeMatch[1]
           });
         }
       });
     }
 
-    // Extract CGPA/GPA if available
-    const pageText = $.text();
-    const cgpaMatch = pageText.match(/CGPA:?\s*([0-9]+\.[0-9]+)/i) || 
-                     pageText.match(/GPA:?\s*([0-9]+\.[0-9]+)/i) ||
-                     pageText.match(/([0-9]+\.[0-9]+)\s*(?:CGPA|GPA)/i);
-    
-    const cgpa = cgpaMatch ? cgpaMatch[1] : 'Not available';
-
     return {
       success: true,
       studentInfo: studentInfo,
       grades: grades,
-      cgpa: cgpa,
-      summary: `Found ${grades.length} course records`
+      cgpa: 'Check portal',
+      summary: `Found ${grades.length} items`
     };
-    
+
   } catch (error) {
-    console.error('Parse grade error:', error);
+    console.log('Parse error:', error);
     return {
       success: false,
-      error: 'Could not parse grade information from portal.'
+      error: 'Could not parse grade data'
     };
   }
 }
 
-// Function to parse data from dashboard
-function parseDashboardData($, username) {
-  try {
-    const studentInfo = {
-      name: $('.user-name, .profile-name, .student-name').first().text().trim() || 'Student',
-      id: username,
-      program: 'N/A'
-    };
-
-    // Look for academic information
-    const academicInfo = [];
-    $('.card, .panel, .widget, .alert').each((i, element) => {
-      const $element = $(element);
-      const text = $element.text();
-      if (text.includes('GPA') || text.includes('Grade') || text.includes('Credit') || 
-          text.includes('Semester') || text.includes('Result')) {
-        academicInfo.push(text.replace(/\s+/g, ' ').trim().substring(0, 100));
-      }
-    });
-
-    return {
-      success: true,
-      studentInfo: studentInfo,
-      grades: [],
-      cgpa: 'Check grade portal',
-      summary: 'Login successful but could not access grades directly',
-      academicInfo: academicInfo.slice(0, 3)
-    };
-    
-  } catch (error) {
-    return {
-      success: false,
-      error: 'Could not access student information.'
-    };
-  }
-}
-
-// Format grade response for Telegram
+// Format response
 function formatGradeResponse(gradeData) {
   if (!gradeData.success) {
-    return `❌ *Error*\n\n${gradeData.error}\n\nPlease check your credentials and try again.`;
+    return `❌ *Error*\n\n${gradeData.error}`;
   }
 
-  let response = `🎓 *Jimma University - Grade Report*\n\n`;
+  let response = `🎓 *Jimma University*\n\n`;
   response += `👤 *Name:* ${gradeData.studentInfo.name}\n`;
-  response += `🆔 *ID:* ${gradeData.studentInfo.id}\n`;
-  response += `📚 *Program:* ${gradeData.studentInfo.program}\n\n`;
-
-  if (gradeData.academicInfo && gradeData.academicInfo.length > 0) {
-    response += `📋 *Academic Information:*\n`;
-    gradeData.academicInfo.forEach(info => {
-      response += `• ${info}\n`;
-    });
-    response += `\n`;
-  }
+  response += `🆔 *ID:* ${gradeData.studentInfo.id}\n\n`;
 
   if (gradeData.grades.length > 0) {
-    response += `📊 *Course Grades:*\n\`\`\`\n`;
-    response += `Code       | Grade\n`;
-    response += `---------- | -----\n`;
+    response += `📊 *Results:*\n\`\`\`\n`;
     
-    gradeData.grades.slice(0, 15).forEach(course => {
-      response += `${course.code.padEnd(10)} | ${course.grade}\n`;
+    gradeData.grades.slice(0, 10).forEach(course => {
+      response += `${course.code}: ${course.grade}\n`;
     });
     
-    if (gradeData.grades.length > 15) {
-      response += `... and ${gradeData.grades.length - 15} more\n`;
+    if (gradeData.grades.length > 10) {
+      response += `... ${gradeData.grades.length - 10} more\n`;
     }
     
     response += `\`\`\`\n`;
-    response += `📈 *CGPA/GPA:* ${gradeData.cgpa}\n`;
-    response += `📖 *Total Courses:* ${gradeData.grades.length}\n`;
   } else {
-    response += `ℹ️ *Note:* ${gradeData.summary}\n`;
-    response += `Please visit the portal directly for detailed grades.`;
+    response += `ℹ️ No grade data found.\n`;
+    response += `You are logged in but no grades were detected.\n`;
   }
 
-  response += `\n\n🔄 *Last checked:* ${new Date().toLocaleString()}`;
+  response += `\n🔄 *Status:* ${gradeData.summary}`;
 
   return response;
 }
 
-// Bot command handlers
+// Bot commands
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  const welcomeMessage = `🤖 *Jimma University Grade Bot*\n\n`
-    + `I can help you check your grades from the official JU portal.\n\n`
-    + `*Available Commands:*\n`
-    + `/login - Login to check your grades\n`
-    + `/help - Get help information\n\n`
-    + `*How it works:*\n`
-    + `1. Use /login with your portal credentials\n`
-    + `2. I securely fetch your grades from JU portal\n`
-    + `3. View your results directly in Telegram\n\n`
-    + `*Privacy:* Your credentials are not stored.`;
-
-  bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
+  bot.sendMessage(chatId, 
+    `🤖 *JU Grade Bot*\n\n` +
+    `Use /login to check your grades.\n\n` +
+    `*Note:* This is a debug version.`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.onText(/\/login/, (msg) => {
   const chatId = msg.chat.id;
   userSessions.set(chatId, { step: 'awaiting_username' });
-  
-  bot.sendMessage(chatId, 
-    `🔐 *JU Portal Login*\n\n`
-    + `Please enter your JU portal username/ID:`,
-    { parse_mode: 'Markdown' }
-  );
+  bot.sendMessage(chatId, 'Enter your JU username:');
 });
 
-bot.onText(/\/help/, (msg) => {
-  const chatId = msg.chat.id;
-  const helpMessage = `🆘 *Help Guide*\n\n`
-    + `*Login Issues:*\n`
-    + `• Use your official JU portal credentials\n`
-    + `• Make sure your username and password are correct\n`
-    + `• The portal must be accessible\n\n`
-    + `*Commands:*\n`
-    + `/start - Start the bot\n`
-    + `/login - Login to portal\n`
-    + `/help - Show this help\n\n`
-    + `*Note:* This bot only reads grade information and does not store any data.`;
-
-  bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
-});
-
-// Handle credential input
+// Handle messages
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
   const userData = userSessions.get(chatId);
 
-  if (!userData || userData.step === undefined) return;
+  if (!userData || !text || text.startsWith('/')) return;
 
-  if (userData.step === 'awaiting_username' && !text.startsWith('/')) {
-    userData.username = text.trim();
+  if (userData.step === 'awaiting_username') {
+    userData.username = text;
     userData.step = 'awaiting_password';
+    bot.sendMessage(chatId, 'Enter your password:');
     
-    bot.sendMessage(chatId,
-      `✅ Username: ${text}\n\n`
-      + `Now please enter your portal password:`
-    );
+  } else if (userData.step === 'awaiting_password') {
+    userData.password = text;
+    userData.step = 'logging_in';
     
-  } else if (userData.step === 'awaiting_password' && !text.startsWith('/')) {
-    userData.password = text.trim();
-    userData.step = 'fetching';
-    
-    const loadingMsg = await bot.sendMessage(chatId, '⏳ Logging into JU portal...');
+    const loadingMsg = await bot.sendMessage(chatId, '⏳ Logging in...');
     
     try {
+      console.log(`=== Starting login for user: ${userData.username} ===`);
       const gradeData = await fetchJUGrades(userData.username, userData.password);
-      const responseText = formatGradeResponse(gradeData);
       
       // Clear sensitive data
       userData.password = null;
       userSessions.delete(chatId);
       
+      const responseText = formatGradeResponse(gradeData);
       bot.editMessageText(responseText, {
         chat_id: chatId,
         message_id: loadingMsg.message_id,
@@ -378,27 +336,17 @@ bot.on('message', async (msg) => {
       
     } catch (error) {
       console.error('Final error:', error);
-      bot.editMessageText(
-        '❌ An unexpected error occurred. Please try again later.',
-        {
-          chat_id: chatId,
-          message_id: loadingMsg.message_id
-        }
-      );
-      
+      bot.editMessageText('❌ Unexpected error. Check logs.', {
+        chat_id: chatId,
+        message_id: loadingMsg.message_id
+      });
       userSessions.delete(chatId);
     }
   }
 });
 
-// Error handling
-bot.on('error', (error) => {
-  console.error('Bot error:', error);
-});
-
-// Vercel serverless function handler
+// Vercel handler
 module.exports = async (req, res) => {
-  // Set webhook on first run
   if (process.env.VERCEL_URL && !process.env.WEBHOOK_SET) {
     await setWebhook();
     process.env.WEBHOOK_SET = 'true';
@@ -406,17 +354,13 @@ module.exports = async (req, res) => {
 
   if (req.method === 'POST') {
     try {
-      const update = req.body;
-      await bot.processUpdate(update);
+      await bot.processUpdate(req.body);
       res.status(200).json({ status: 'ok' });
     } catch (error) {
-      console.error('Error processing update:', error);
-      res.status(500).json({ error: 'Internal Server Error' });
+      console.error('Handler error:', error);
+      res.status(500).json({ error: error.message });
     }
   } else {
-    res.status(200).json({ 
-      message: 'Jimma University Grade Bot is running!',
-      timestamp: new Date().toISOString()
-    });
+    res.status(200).json({ status: 'Bot is running' });
   }
 };
