@@ -5,8 +5,14 @@ const cheerio = require('cheerio');
 // Initialize bot
 const bot = new TelegramBot(process.env.BOT_TOKEN, { webHook: true });
 
-// Jimma University Portal URL
-const JU_PORTAL_URL = 'https://portal.ju.edu.et';
+// Jimma University Portal URLs
+const JU_BASE_URL = 'https://portal.ju.edu.et';
+const PORTAL_URLS = {
+  login: `${JU_BASE_URL}/login`,
+  announcement: `${JU_BASE_URL}/announce/show`,
+  grades: `${JU_BASE_URL}/student/academic/grade`,
+  dashboard: `${JU_BASE_URL}/student/dashboard`
+};
 
 // Store user sessions temporarily
 const userSessions = new Map();
@@ -22,100 +28,89 @@ const setWebhook = async () => {
 
 // Function to login and fetch grades from JU portal
 async function fetchJUGrades(username, password) {
+  let session = null;
+  
   try {
     // Create axios session to maintain cookies
-    const session = axios.create({
-      baseURL: JU_PORTAL_URL,
+    session = axios.create({
       timeout: 30000,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-
-    console.log('Attempting login for:', username);
-
-    // Step 1: Get login page to obtain cookies and any tokens
-    const loginPageResponse = await session.get('/login');
-    const $login = cheerio.load(loginPageResponse.data);
-
-    // Extract CSRF token or any hidden fields (common in Laravel apps)
-    const csrfToken = $login('input[name="_token"]').val() || 
-                     $login('meta[name="csrf-token"]').attr('content');
-
-    // Step 2: Perform login
-    const loginData = {
-      username: username,
-      password: password,
-      _token: csrfToken
-    };
-
-    const loginResponse = await session.post('/login', loginData, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': `${JU_PORTAL_URL}/login`
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive'
       },
       maxRedirects: 5
     });
 
-    // Check if login was successful
-    if (loginResponse.request?.res?.responseUrl?.includes('dashboard') || 
-        loginResponse.data?.includes('dashboard') ||
-        loginResponse.status === 200) {
+    console.log('Step 1: Getting login page for:', username);
+
+    // Step 1: Get login page to obtain cookies and CSRF token
+    const loginPageResponse = await session.get(PORTAL_URLS.login);
+    console.log('Login page status:', loginPageResponse.status);
+    
+    const $login = cheerio.load(loginPageResponse.data);
+    
+    // Extract CSRF token
+    let csrfToken = $login('input[name="_token"]').val();
+    console.log('CSRF Token found:', !!csrfToken);
+
+    // Prepare login data
+    const loginData = new URLSearchParams();
+    loginData.append('username', username);
+    loginData.append('password', password);
+    
+    if (csrfToken) {
+      loginData.append('_token', csrfToken);
+    }
+
+    console.log('Step 2: Attempting login...');
+
+    // Step 2: Perform login
+    const loginResponse = await session.post(PORTAL_URLS.login, loginData, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': PORTAL_URLS.login,
+        'Origin': JU_BASE_URL
+      }
+    });
+
+    console.log('Login response status:', loginResponse.status);
+
+    // Check if login was successful by trying to access grades page
+    try {
+      console.log('Step 3: Accessing grades page...');
+      const gradesResponse = await session.get(PORTAL_URLS.grades);
       
-      console.log('Login successful for:', username);
-
-      // Step 3: Navigate to grades/transcript page
-      // Common grade page URLs in university portals
-      const gradeUrls = [
-        '/student/grade',
-        '/student/grades',
-        '/student/transcript',
-        '/grades',
-        '/transcript',
-        '/student/academic-record'
-      ];
-
-      let gradeData = null;
-
-      for (const gradeUrl of gradeUrls) {
-        try {
-          const gradeResponse = await session.get(gradeUrl);
-          const $grades = cheerio.load(gradeResponse.data);
-          
-          // Parse grade information - adjust selectors based on actual portal structure
-          gradeData = parseGradeData($grades);
-          if (gradeData.success) break;
-        } catch (error) {
-          console.log(`Tried ${gradeUrl}:`, error.message);
-          continue;
-        }
+      if (gradesResponse.status === 200) {
+        const $grades = cheerio.load(gradesResponse.data);
+        const gradeData = parseGradeData($grades, username);
+        return gradeData;
+      } else {
+        return {
+          success: false,
+          error: 'Access denied to grade page. Please check your credentials.'
+        };
       }
-
-      if (!gradeData) {
-        // If specific grade pages don't work, try dashboard for basic info
-        const dashboardResponse = await session.get('/student/dashboard');
-        const $dashboard = cheerio.load(dashboardResponse.data);
-        gradeData = parseDashboardData($dashboard, username);
-      }
-
-      return gradeData;
-
-    } else {
-      return {
-        success: false,
-        error: 'Login failed. Please check your username and password.'
-      };
+    } catch (gradeError) {
+      console.log('Grade page access failed, trying dashboard...');
+      
+      // Try dashboard as fallback
+      const dashboardResponse = await session.get(PORTAL_URLS.dashboard);
+      const $dashboard = cheerio.load(dashboardResponse.data);
+      const dashboardData = parseDashboardData($dashboard, username);
+      return dashboardData;
     }
 
   } catch (error) {
-    console.error('Fetch grade error:', error.response?.data || error.message);
+    console.error('Fetch grade error:', error.message);
     
-    if (error.response?.status === 401) {
+    if (error.response?.status === 401 || error.response?.status === 403) {
       return {
         success: false,
         error: 'Invalid username or password.'
       };
-    } else if (error.code === 'ECONNREFUSED') {
+    } else if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
       return {
         success: false,
         error: 'University portal is currently unavailable. Please try again later.'
@@ -123,72 +118,90 @@ async function fetchJUGrades(username, password) {
     } else {
       return {
         success: false,
-        error: 'Failed to connect to university portal. Please try again later.'
+        error: `Login failed: ${error.message}`
       };
     }
   }
 }
 
 // Function to parse grade data from grade page
-function parseGradeData($) {
+function parseGradeData($, username) {
   try {
     const grades = [];
-    let studentInfo = {};
+    let studentInfo = {
+      name: 'Student',
+      id: username,
+      program: 'N/A'
+    };
     
-    // Extract student information (common selectors)
-    studentInfo.name = $('.student-name, .profile-name, [class*="name"]').first().text().trim() || 
-                      $('h1, h2, h3').filter((i, el) => $(el).text().includes('Name')).next().text().trim();
-    
-    studentInfo.id = $('.student-id, .registration-no, [class*="id"]').first().text().trim();
-    studentInfo.program = $('.program, .department, [class*="program"]').first().text().trim();
-    
-    // Extract grades from tables (common patterns)
+    // Try to extract student information
+    studentInfo.name = $('.student-name, .profile-name, .user-name').first().text().trim() || 
+                      $('h1, h2, h3').first().text().trim() ||
+                      studentInfo.name;
+
+    // Extract grades from tables - look for grade tables specifically
     $('table').each((tableIndex, table) => {
       const $table = $(table);
-      const headers = [];
+      const tableText = $table.text().toLowerCase();
       
-      // Get table headers
-      $table.find('thead th, tr:first th').each((i, th) => {
-        headers.push($(th).text().trim().toLowerCase());
-      });
-      
-      // Look for grade-related headers
-      const isGradeTable = headers.some(header => 
-        header.includes('grade') || header.includes('credit') || 
-        header.includes('course') || header.includes('code')
-      );
-      
-      if (isGradeTable) {
-        $table.find('tbody tr, tr:not(:first)').each((i, row) => {
-          const $row = $(row);
-          const cols = $row.find('td');
-          
-          if (cols.length >= 3) {
-            const course = {
-              code: $(cols[0]).text().trim(),
-              name: $(cols[1]).text().trim(),
-              credit: $(cols[2]).text().trim(),
-              grade: $(cols[3] || cols[2]).text().trim()
-            };
+      // Check if this table likely contains grade information
+      if (tableText.includes('grade') || tableText.includes('credit') || 
+          tableText.includes('course') || tableText.includes('code') ||
+          tableText.includes('subject') || tableText.includes('result')) {
+        
+        $table.find('tr').each((rowIndex, row) => {
+          if (rowIndex > 0) { // Skip header row
+            const $row = $(row);
+            const cols = $row.find('td');
             
-            if (course.code && course.grade) {
-              grades.push(course);
+            if (cols.length >= 4) {
+              const course = {
+                code: $(cols[0]).text().trim() || `C${rowIndex}`,
+                name: $(cols[1]).text().trim() || 'Course',
+                credit: $(cols[2]).text().trim() || '0',
+                grade: $(cols[3]).text().trim() || 'N/A'
+              };
+              
+              // Only add if it looks like a real course
+              if (course.code && course.grade && course.grade !== 'N/A') {
+                grades.push(course);
+              }
             }
           }
         });
       }
     });
+
+    // If no grades found in structured tables, try to find any grade-like data
+    if (grades.length === 0) {
+      $('td, .grade, .result').each((i, element) => {
+        const text = $(element).text().trim();
+        const gradeMatch = text.match(/^[A-F][+-]?$|^[0-4]\.?[0-9]*$/);
+        if (gradeMatch) {
+          grades.push({
+            code: `C${i+1}`,
+            name: 'Course',
+            credit: '0',
+            grade: text
+          });
+        }
+      });
+    }
+
+    // Extract CGPA/GPA if available
+    const pageText = $.text();
+    const cgpaMatch = pageText.match(/CGPA:?\s*([0-9]+\.[0-9]+)/i) || 
+                     pageText.match(/GPA:?\s*([0-9]+\.[0-9]+)/i) ||
+                     pageText.match(/([0-9]+\.[0-9]+)\s*(?:CGPA|GPA)/i);
     
-    // Extract CGPA/GPA
-    const cgpa = $('.cgpa, .gpa, [class*="gpa"]').first().text().trim() ||
-                 $('strong, b').filter((i, el) => $(el).text().includes('GPA') || $(el).text().includes('CGPA')).parent().text().match(/\d+\.\d+/)?.[0];
-    
+    const cgpa = cgpaMatch ? cgpaMatch[1] : 'Not available';
+
     return {
       success: true,
       studentInfo: studentInfo,
       grades: grades,
-      cgpa: cgpa || 'Not available',
-      summary: `Found ${grades.length} courses`
+      cgpa: cgpa,
+      summary: `Found ${grades.length} course records`
     };
     
   } catch (error) {
@@ -204,33 +217,35 @@ function parseGradeData($) {
 function parseDashboardData($, username) {
   try {
     const studentInfo = {
-      name: $('.user-name, .profile-name').first().text().trim() || 'Student',
-      id: username
+      name: $('.user-name, .profile-name, .student-name').first().text().trim() || 'Student',
+      id: username,
+      program: 'N/A'
     };
-    
-    // Look for any academic information on dashboard
+
+    // Look for academic information
     const academicInfo = [];
-    $('.card, .panel, .widget').each((i, element) => {
+    $('.card, .panel, .widget, .alert').each((i, element) => {
       const $element = $(element);
       const text = $element.text();
-      if (text.includes('GPA') || text.includes('Grade') || text.includes('Credit')) {
-        academicInfo.push(text.trim());
+      if (text.includes('GPA') || text.includes('Grade') || text.includes('Credit') || 
+          text.includes('Semester') || text.includes('Result')) {
+        academicInfo.push(text.replace(/\s+/g, ' ').trim().substring(0, 100));
       }
     });
-    
+
     return {
       success: true,
       studentInfo: studentInfo,
       grades: [],
       cgpa: 'Check grade portal',
-      summary: 'Accessed dashboard. Use university portal for detailed grades.',
-      academicInfo: academicInfo
+      summary: 'Login successful but could not access grades directly',
+      academicInfo: academicInfo.slice(0, 3)
     };
     
   } catch (error) {
     return {
       success: false,
-      error: 'Could not access academic information.'
+      error: 'Could not access student information.'
     };
   }
 }
@@ -238,13 +253,13 @@ function parseDashboardData($, username) {
 // Format grade response for Telegram
 function formatGradeResponse(gradeData) {
   if (!gradeData.success) {
-    return `❌ *Error*\n\n${gradeData.error}`;
+    return `❌ *Error*\n\n${gradeData.error}\n\nPlease check your credentials and try again.`;
   }
 
   let response = `🎓 *Jimma University - Grade Report*\n\n`;
-  response += `👤 *Name:* ${gradeData.studentInfo.name || 'N/A'}\n`;
-  response += `🆔 *ID:* ${gradeData.studentInfo.id || 'N/A'}\n`;
-  response += `📚 *Program:* ${gradeData.studentInfo.program || 'N/A'}\n\n`;
+  response += `👤 *Name:* ${gradeData.studentInfo.name}\n`;
+  response += `🆔 *ID:* ${gradeData.studentInfo.id}\n`;
+  response += `📚 *Program:* ${gradeData.studentInfo.program}\n\n`;
 
   if (gradeData.academicInfo && gradeData.academicInfo.length > 0) {
     response += `📋 *Academic Information:*\n`;
@@ -259,19 +274,23 @@ function formatGradeResponse(gradeData) {
     response += `Code       | Grade\n`;
     response += `---------- | -----\n`;
     
-    gradeData.grades.slice(0, 15).forEach(course => { // Limit to 15 courses
-      response += `${(course.code || '').substring(0, 10).padEnd(10)} | ${course.grade}\n`;
+    gradeData.grades.slice(0, 15).forEach(course => {
+      response += `${course.code.padEnd(10)} | ${course.grade}\n`;
     });
+    
+    if (gradeData.grades.length > 15) {
+      response += `... and ${gradeData.grades.length - 15} more\n`;
+    }
     
     response += `\`\`\`\n`;
     response += `📈 *CGPA/GPA:* ${gradeData.cgpa}\n`;
     response += `📖 *Total Courses:* ${gradeData.grades.length}\n`;
   } else {
-    response += `ℹ️ *Note:* ${gradeData.summary || 'No detailed grades found.'}\n`;
-    response += `Please check your grades directly on the university portal.`;
+    response += `ℹ️ *Note:* ${gradeData.summary}\n`;
+    response += `Please visit the portal directly for detailed grades.`;
   }
 
-  response += `\n\n🔄 *Last Updated:* ${new Date().toLocaleDateString()}`;
+  response += `\n\n🔄 *Last checked:* ${new Date().toLocaleString()}`;
 
   return response;
 }
@@ -281,11 +300,14 @@ bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const welcomeMessage = `🤖 *Jimma University Grade Bot*\n\n`
     + `I can help you check your grades from the official JU portal.\n\n`
-    + `*How to use:*\n`
-    + `1. Use /login to enter your portal credentials\n`
-    + `2. I'll fetch your latest grades securely\n`
-    + `3. View your academic progress\n\n`
-    + `*Privacy:* Your credentials are not stored and are only used for this session.`;
+    + `*Available Commands:*\n`
+    + `/login - Login to check your grades\n`
+    + `/help - Get help information\n\n`
+    + `*How it works:*\n`
+    + `1. Use /login with your portal credentials\n`
+    + `2. I securely fetch your grades from JU portal\n`
+    + `3. View your results directly in Telegram\n\n`
+    + `*Privacy:* Your credentials are not stored.`;
 
   bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'Markdown' });
 });
@@ -296,15 +318,7 @@ bot.onText(/\/login/, (msg) => {
   
   bot.sendMessage(chatId, 
     `🔐 *JU Portal Login*\n\n`
-    + `Please enter your Jimma University portal username:`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-bot.onText(/\/grades/, (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId,
-    `📊 To view your grades, please login first using /login command.`,
+    + `Please enter your JU portal username/ID:`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -312,15 +326,15 @@ bot.onText(/\/grades/, (msg) => {
 bot.onText(/\/help/, (msg) => {
   const chatId = msg.chat.id;
   const helpMessage = `🆘 *Help Guide*\n\n`
+    + `*Login Issues:*\n`
+    + `• Use your official JU portal credentials\n`
+    + `• Make sure your username and password are correct\n`
+    + `• The portal must be accessible\n\n`
     + `*Commands:*\n`
     + `/start - Start the bot\n`
-    + `/login - Login to JU portal\n`
-    + `/grades - View your grades\n`
-    + `/help - This help message\n\n`
-    + `*Note:*\n`
-    + `• Use your official JU portal credentials\n`
-    + `• System follows JU's security protocols\n`
-    + `• Your data is not stored on our servers`;
+    + `/login - Login to portal\n`
+    + `/help - Show this help\n\n`
+    + `*Note:* This bot only reads grade information and does not store any data.`;
 
   bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
 });
@@ -338,7 +352,7 @@ bot.on('message', async (msg) => {
     userData.step = 'awaiting_password';
     
     bot.sendMessage(chatId,
-      `✅ Username saved\n\n`
+      `✅ Username: ${text}\n\n`
       + `Now please enter your portal password:`
     );
     
@@ -352,7 +366,7 @@ bot.on('message', async (msg) => {
       const gradeData = await fetchJUGrades(userData.username, userData.password);
       const responseText = formatGradeResponse(gradeData);
       
-      // Clear password from memory
+      // Clear sensitive data
       userData.password = null;
       userSessions.delete(chatId);
       
@@ -363,8 +377,9 @@ bot.on('message', async (msg) => {
       });
       
     } catch (error) {
+      console.error('Final error:', error);
       bot.editMessageText(
-        '❌ An error occurred while fetching grades. Please try again later.',
+        '❌ An unexpected error occurred. Please try again later.',
         {
           chat_id: chatId,
           message_id: loadingMsg.message_id
